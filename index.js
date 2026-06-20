@@ -352,8 +352,20 @@ app.post('/api/favorites', verifyToken, async (req, res) => {
 
 // admin users list
 app.get('/api/admin/users', verifyToken, verifyAdmin, async (req, res) => {
-    const users = await usersCollection.find({}).toArray();
-    res.send(users);
+    try {
+        const users = await usersCollection.find({}).toArray();
+        const usersWithCount = await Promise.all(users.map(async (usr) => {
+            const count = await lessonsCollection.countDocuments({ authorEmail: usr.email });
+            return {
+                ...usr,
+                lessonsCount: count
+            };
+        }));
+        res.send(usersWithCount);
+    } catch (err) {
+        console.error("Error fetching admin users:", err);
+        res.status(500).send({ error: "Failed to fetch users" });
+    }
 });
 
 // admin update user
@@ -379,6 +391,41 @@ app.patch('/api/admin/users/:id', verifyToken, verifyAdmin, async (req, res) => 
 
     const result = await usersCollection.updateOne(query, updateDoc);
     res.send(result);
+});
+
+// admin delete user
+app.delete('/api/admin/users/:id', verifyToken, verifyAdmin, async (req, res) => {
+    try {
+        const id = req.params.id;
+        
+        let query = { _id: id };
+        let user = await usersCollection.findOne(query);
+        if (!user) {
+            query = { _id: new ObjectId(id) };
+            user = await usersCollection.findOne(query);
+        }
+
+        if (!user) {
+            return res.status(404).send({ error: 'User not found' });
+        }
+
+        // Prevent self deletion
+        if (user.email === req.user.email) {
+            return res.status(400).send({ error: 'You cannot delete your own admin account!' });
+        }
+
+        const result = await usersCollection.deleteOne(query);
+        
+        // Cascade delete: delete all lessons created by this user
+        if (user.email) {
+            await lessonsCollection.deleteMany({ authorEmail: user.email });
+        }
+
+        res.send(result);
+    } catch (err) {
+        console.error("Error deleting user:", err);
+        res.status(500).send({ error: "Failed to delete user" });
+    }
 });
 
 // admin dashboard stats
