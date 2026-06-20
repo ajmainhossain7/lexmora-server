@@ -43,7 +43,11 @@ client.connect(() => {
 const database = client.db("lexmora_db");
 const lessonsCollection = database.collection("lessons");
 const commentsCollection = database.collection("comments");
+const usersCollection = database.collection("user");
+const favoritesCollection = database.collection("favorites");
 
+const sessionCollection = database.collection('session');
+const reportsCollection = database.collection('reports');
 
 
 // verification related middleware
@@ -180,6 +184,88 @@ app.post('/api/comments', async (req, res) => {
 });
 
 
+
+// my lessons endpoint
+app.get('/api/my/lessons', verifyToken, async (req, res) => {
+    const query = { authorEmail: req.user.email };
+    const cursor = lessonsCollection.find(query);
+    const result = await cursor.toArray();
+    res.send(result);
+});
+
+// update lesson endpoint
+app.patch('/api/lessons/:id', verifyToken, async (req, res) => {
+    const id = req.params.id;
+    const updatedFields = req.body;
+    const filter = { _id: new ObjectId(id) };
+
+    // If not admin, verify ownership
+    const lesson = await lessonsCollection.findOne(filter);
+    if (!lesson) {
+        return res.status(404).send({ error: 'Lesson not found' });
+    }
+    if (req.user.role !== 'admin' && lesson.authorEmail !== req.user.email) {
+        return res.status(403).send({ error: 'Forbidden' });
+    }
+
+    const updateDoc = {
+        $set: {}
+    };
+
+    if (updatedFields.title !== undefined) updateDoc.$set.title = updatedFields.title;
+    if (updatedFields.description !== undefined) updateDoc.$set.description = updatedFields.description;
+    if (updatedFields.category !== undefined) updateDoc.$set.category = updatedFields.category;
+    if (updatedFields.emotionalTone !== undefined) updateDoc.$set.emotionalTone = updatedFields.emotionalTone;
+    if (updatedFields.coverImage !== undefined) updateDoc.$set.coverImage = updatedFields.coverImage;
+    if (updatedFields.visibility !== undefined) updateDoc.$set.visibility = updatedFields.visibility;
+    if (updatedFields.accessLevel !== undefined) updateDoc.$set.accessLevel = updatedFields.accessLevel;
+    if (updatedFields.isFeatured !== undefined && req.user.role === 'admin') {
+        updateDoc.$set.isFeatured = updatedFields.isFeatured;
+    }
+
+    const result = await lessonsCollection.updateOne(filter, updateDoc);
+    res.send(result);
+});
+
+
+
+// favorites check (is a specific lesson favorited?)
+app.get('/api/favorites/check', verifyToken, async (req, res) => {
+    const { lessonId } = req.query;
+    const userId = req.user._id.toString();
+    const existing = await favoritesCollection.findOne({ userId, lessonId });
+    res.send({ favorited: !!existing });
+});
+
+// favorites
+app.get('/api/favorites', verifyToken, async (req, res) => {
+    const query = { userId: req.user._id.toString() };
+    const list = await favoritesCollection.find(query).toArray();
+    
+    // Populate lessons details
+    const lessonIds = list.map(item => new ObjectId(item.lessonId));
+    const lessons = await lessonsCollection.find({ _id: { $in: lessonIds } }).toArray();
+    res.send(lessons);
+});
+
+app.post('/api/favorites', verifyToken, async (req, res) => {
+    const { lessonId } = req.body;
+    const userId = req.user._id.toString();
+    const query = { userId, lessonId };
+    
+    const existing = await favoritesCollection.findOne(query);
+    if (existing) {
+        await favoritesCollection.deleteOne(query);
+        return res.send({ favorited: false });
+    } else {
+        await favoritesCollection.insertOne({
+            userId,
+            lessonId,
+            createdAt: new Date()
+        });
+        return res.send({ favorited: true });
+    }
+});
 
 // admin users list
 app.get('/api/admin/users', verifyToken, verifyAdmin, async (req, res) => {
