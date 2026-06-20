@@ -42,6 +42,8 @@ client.connect(() => {
 // Setup database collections
 const database = client.db("lexmora_db");
 const lessonsCollection = database.collection("lessons");
+const commentsCollection = database.collection("comments");
+
 
 
 // verification related middleware
@@ -153,6 +155,27 @@ app.post('/api/lessons', async (req, res) => {
         createdAt: new Date()
     };
     const result = await lessonsCollection.insertOne(newLesson);
+    res.send(result);
+});
+
+// comments related endpoints
+app.get('/api/comments', async (req, res) => {
+    const query = {};
+    if (req.query.lessonId) {
+        query.lessonId = req.query.lessonId;
+    }
+    const cursor = commentsCollection.find(query);
+    const result = await cursor.toArray();
+    res.send(result);
+});
+
+app.post('/api/comments', async (req, res) => {
+    const comment = req.body;
+    const newComment = {
+        ...comment,
+        createdAt: new Date()
+    };
+    const result = await commentsCollection.insertOne(newComment);
     res.send(result);
 });
 
