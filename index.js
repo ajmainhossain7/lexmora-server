@@ -201,7 +201,29 @@ app.delete('/api/lessons/:id', verifyToken, async (req, res) => {
     res.send(result);
 });
 
+// like toggling
+app.post('/api/lessons/:id/like', verifyToken, async (req, res) => {
+    const id = req.params.id;
+    const userId = req.user._id.toString();
+    const filter = { _id: new ObjectId(id) };
+    
+    const lesson = await lessonsCollection.findOne(filter);
+    if (!lesson) {
+        return res.status(404).send({ error: 'Lesson not found' });
+    }
 
+    const likes = lesson.likes || [];
+    let updateDoc;
+    
+    if (likes.includes(userId)) {
+        updateDoc = { $pull: { likes: userId } };
+    } else {
+        updateDoc = { $addToSet: { likes: userId } };
+    }
+
+    const result = await lessonsCollection.updateOne(filter, updateDoc);
+    res.send(result);
+});
 
 // my lessons endpoint
 app.get('/api/my/lessons', verifyToken, async (req, res) => {
