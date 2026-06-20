@@ -184,6 +184,47 @@ app.post('/api/comments', async (req, res) => {
     res.send(result);
 });
 
+// reports related endpoints
+app.post('/api/reports', verifyToken, async (req, res) => {
+    const report = req.body;
+    const newReport = {
+        ...report,
+        userId: req.user._id.toString(),
+        userName: req.user.name,
+        userEmail: req.user.email,
+        createdAt: new Date()
+    };
+    const result = await reportsCollection.insertOne(newReport);
+    res.send(result);
+});
+
+app.get('/api/reports', verifyToken, verifyAdmin, async (req, res) => {
+    const reports = await reportsCollection.find({}).toArray();
+
+    // Populate lesson details
+    const populated = [];
+    for (const report of reports) {
+        let lesson = null;
+        try {
+            lesson = await lessonsCollection.findOne({ _id: new ObjectId(report.lessonId) });
+        } catch (e) {
+            lesson = await lessonsCollection.findOne({ _id: report.lessonId });
+        }
+        populated.push({
+            ...report,
+            lessonTitle: lesson ? lesson.title : 'Deleted Lesson',
+            lessonAuthor: lesson ? (lesson.authorName || lesson.author?.name || 'Unknown') : 'Unknown'
+        });
+    }
+    res.send(populated);
+});
+
+app.delete('/api/reports/:id', verifyToken, verifyAdmin, async (req, res) => {
+    const id = req.params.id;
+    const result = await reportsCollection.deleteOne({ _id: new ObjectId(id) });
+    res.send(result);
+});
+
 // delete lesson endpoint
 app.delete('/api/lessons/:id', verifyToken, async (req, res) => {
     const id = req.params.id;
@@ -198,6 +239,8 @@ app.delete('/api/lessons/:id', verifyToken, async (req, res) => {
     }
 
     const result = await lessonsCollection.deleteOne(filter);
+    // Delete any associated reports
+    await reportsCollection.deleteMany({ lessonId: id });
     res.send(result);
 });
 
@@ -206,7 +249,7 @@ app.post('/api/lessons/:id/like', verifyToken, async (req, res) => {
     const id = req.params.id;
     const userId = req.user._id.toString();
     const filter = { _id: new ObjectId(id) };
-    
+
     const lesson = await lessonsCollection.findOne(filter);
     if (!lesson) {
         return res.status(404).send({ error: 'Lesson not found' });
@@ -214,7 +257,7 @@ app.post('/api/lessons/:id/like', verifyToken, async (req, res) => {
 
     const likes = lesson.likes || [];
     let updateDoc;
-    
+
     if (likes.includes(userId)) {
         updateDoc = { $pull: { likes: userId } };
     } else {
@@ -233,7 +276,7 @@ app.get('/api/my/lessons', verifyToken, async (req, res) => {
     res.send(result);
 });
 
-// update lesson endpoint
+// update lesson 
 app.patch('/api/lessons/:id', verifyToken, async (req, res) => {
     const id = req.params.id;
     const updatedFields = req.body;
@@ -281,7 +324,7 @@ app.get('/api/favorites/check', verifyToken, async (req, res) => {
 app.get('/api/favorites', verifyToken, async (req, res) => {
     const query = { userId: req.user._id.toString() };
     const list = await favoritesCollection.find(query).toArray();
-    
+
     // Populate lessons details
     const lessonIds = list.map(item => new ObjectId(item.lessonId));
     const lessons = await lessonsCollection.find({ _id: { $in: lessonIds } }).toArray();
@@ -292,7 +335,7 @@ app.post('/api/favorites', verifyToken, async (req, res) => {
     const { lessonId } = req.body;
     const userId = req.user._id.toString();
     const query = { userId, lessonId };
-    
+
     const existing = await favoritesCollection.findOne(query);
     if (existing) {
         await favoritesCollection.deleteOne(query);
@@ -317,7 +360,7 @@ app.get('/api/admin/users', verifyToken, verifyAdmin, async (req, res) => {
 app.patch('/api/admin/users/:id', verifyToken, verifyAdmin, async (req, res) => {
     const id = req.params.id;
     const { role, plan } = req.body;
-    
+
     // Check if user ID is ObjectId or string
     let query = { _id: id };
     let user = await usersCollection.findOne(query);
@@ -342,10 +385,10 @@ app.patch('/api/admin/users/:id', verifyToken, verifyAdmin, async (req, res) => 
 app.get('/api/admin/stats', verifyToken, verifyAdmin, async (req, res) => {
     const totalUsers = await usersCollection.countDocuments({});
     const totalLessons = await lessonsCollection.countDocuments({});
-    
+
     // Total premium users
     const premiumUsers = await usersCollection.countDocuments({ plan: 'user_premium' });
-    
+
     // Sum revenue from Stripe sessions (assuming 1500 per subscription)
     const totalRevenue = premiumUsers * 1500;
 
@@ -355,6 +398,38 @@ app.get('/api/admin/stats', verifyToken, verifyAdmin, async (req, res) => {
         premiumUsers,
         totalRevenue
     });
+});
+
+// plans 
+app.get('/api/plans', async (req, res) => {
+    const query = {}
+    if (req.query.plan_id) {
+        query.id = req.query.plan_id
+    }
+    const plan = await planCollection.findOne(query);
+    res.send(plan)
+});
+
+// subscription 
+app.post('/api/subscriptions', async (req, res) => {
+    const data = req.body;
+    const subsInfo = {
+        ...data,
+        createdAt: new Date()
+    }
+
+    const result = await subscriptionCollection.insertOne(subsInfo);
+
+    // update the user plan information
+    const filter = { email: data.email };
+    const updateDocument = {
+        $set: {
+            plan: data.planId,
+        },
+    };
+
+    const updateResult = await usersCollection.updateOne(filter, updateDocument);
+    res.send(updateResult);
 });
 
 // Global Async Error Handler Middleware
