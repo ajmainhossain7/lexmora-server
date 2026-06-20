@@ -45,7 +45,8 @@ const lessonsCollection = database.collection("lessons");
 const commentsCollection = database.collection("comments");
 const usersCollection = database.collection("user");
 const favoritesCollection = database.collection("favorites");
-
+const planCollection = database.collection('plans');
+const subscriptionCollection = database.collection('subscriptions');
 const sessionCollection = database.collection('session');
 const reportsCollection = database.collection('reports');
 
@@ -180,6 +181,23 @@ app.post('/api/comments', async (req, res) => {
         createdAt: new Date()
     };
     const result = await commentsCollection.insertOne(newComment);
+    res.send(result);
+});
+
+// delete lesson endpoint
+app.delete('/api/lessons/:id', verifyToken, async (req, res) => {
+    const id = req.params.id;
+    const filter = { _id: new ObjectId(id) };
+
+    const lesson = await lessonsCollection.findOne(filter);
+    if (!lesson) {
+        return res.status(404).send({ error: 'Lesson not found' });
+    }
+    if (req.user.role !== 'admin' && lesson.authorEmail !== req.user.email) {
+        return res.status(403).send({ error: 'Forbidden' });
+    }
+
+    const result = await lessonsCollection.deleteOne(filter);
     res.send(result);
 });
 
