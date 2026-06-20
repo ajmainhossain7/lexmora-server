@@ -383,21 +383,85 @@ app.patch('/api/admin/users/:id', verifyToken, verifyAdmin, async (req, res) => 
 
 // admin dashboard stats
 app.get('/api/admin/stats', verifyToken, verifyAdmin, async (req, res) => {
-    const totalUsers = await usersCollection.countDocuments({});
-    const totalLessons = await lessonsCollection.countDocuments({});
+    try {
+        const totalUsers = await usersCollection.countDocuments({});
+        const totalLessons = await lessonsCollection.countDocuments({});
+        const premiumUsers = await usersCollection.countDocuments({ plan: 'user_premium' });
+        const totalRevenue = premiumUsers * 1500;
+        const totalReports = await reportsCollection.countDocuments({});
+        
+        const publicLessons = await lessonsCollection.countDocuments({ visibility: 'public' });
+        const privateLessons = await lessonsCollection.countDocuments({ visibility: 'private' });
+        
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const todayLessons = await lessonsCollection.countDocuments({ createdAt: { $gte: today } });
 
-    // Total premium users
-    const premiumUsers = await usersCollection.countDocuments({ plan: 'user_premium' });
+        const activeContributors = await lessonsCollection.aggregate([
+            {
+                $group: {
+                    _id: "$authorEmail",
+                    name: { $first: "$authorName" },
+                    avatar: { $first: "$authorAvatar" },
+                    count: { $sum: 1 }
+                }
+            },
+            { $sort: { count: -1 } },
+            { $limit: 5 }
+        ]).toArray();
 
-    // Sum revenue from Stripe sessions (assuming 1500 per subscription)
-    const totalRevenue = premiumUsers * 1500;
+        const lessonsByCategory = await lessonsCollection.aggregate([
+            { $group: { _id: "$category", count: { $sum: 1 } } }
+        ]).toArray();
 
-    res.send({
-        totalUsers,
-        totalLessons,
-        premiumUsers,
-        totalRevenue
-    });
+        const userGrowth = await usersCollection.aggregate([
+            {
+                $project: {
+                    createdAt: { $ifNull: ["$createdAt", new Date()] }
+                }
+            },
+            {
+                $group: {
+                    _id: { $dateToString: { format: "%Y-%m", date: "$createdAt" } },
+                    count: { $sum: 1 }
+                }
+            },
+            { $sort: { _id: 1 } }
+        ]).toArray();
+
+        const lessonGrowth = await lessonsCollection.aggregate([
+            {
+                $project: {
+                    createdAt: { $ifNull: ["$createdAt", new Date()] }
+                }
+            },
+            {
+                $group: {
+                    _id: { $dateToString: { format: "%Y-%m", date: "$createdAt" } },
+                    count: { $sum: 1 }
+                }
+            },
+            { $sort: { _id: 1 } }
+        ]).toArray();
+
+        res.send({
+            totalUsers,
+            totalLessons,
+            premiumUsers,
+            totalRevenue,
+            totalReports,
+            publicLessons,
+            privateLessons,
+            todayLessons,
+            activeContributors,
+            lessonsByCategory,
+            userGrowth,
+            lessonGrowth
+        });
+    } catch (err) {
+        console.error("Error computing admin stats:", err);
+        res.status(500).send({ error: "Failed to compute stats" });
+    }
 });
 
 // plans 
