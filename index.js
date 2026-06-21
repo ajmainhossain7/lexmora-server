@@ -225,6 +225,13 @@ app.delete('/api/reports/:id', verifyToken, verifyAdmin, async (req, res) => {
     res.send(result);
 });
 
+app.delete('/api/reports/lesson/:lessonId', verifyToken, verifyAdmin, async (req, res) => {
+    const lessonId = req.params.lessonId;
+    const result = await reportsCollection.deleteMany({ lessonId: lessonId });
+    res.send(result);
+});
+
+
 // delete lesson endpoint
 app.delete('/api/lessons/:id', verifyToken, async (req, res) => {
     const id = req.params.id;
@@ -304,6 +311,9 @@ app.patch('/api/lessons/:id', verifyToken, async (req, res) => {
     if (updatedFields.accessLevel !== undefined) updateDoc.$set.accessLevel = updatedFields.accessLevel;
     if (updatedFields.isFeatured !== undefined && req.user.role === 'admin') {
         updateDoc.$set.isFeatured = updatedFields.isFeatured;
+    }
+    if (updatedFields.isReviewed !== undefined && req.user.role === 'admin') {
+        updateDoc.$set.isReviewed = updatedFields.isReviewed;
     }
 
     const result = await lessonsCollection.updateOne(filter, updateDoc);
