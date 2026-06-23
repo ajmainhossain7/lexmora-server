@@ -11,6 +11,65 @@ require('dotenv').config();
 app.use(cors());
 
 
+// Stripe Webhook endpoint (defined before global json body parser)
+app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    let event;
+
+    try {
+        const stripeLib = require('stripe')(process.env.STRIPE_SECRET_KEY);
+        event = stripeLib.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+    } catch (err) {
+        console.error('Webhook error:', err.message);
+        return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    if (event.type === 'checkout.session.completed') {
+        const session = event.data.object;
+        const metadata = session.metadata;
+        const planId = metadata?.planId || 'user_premium';
+        const email = metadata?.email || session.customer_email;
+        const userId = metadata?.userId;
+
+        if (email || userId) {
+            let user = null;
+            if (userId) {
+                user = await usersCollection.findOne({
+                    $or: [
+                        { id: userId },
+                        { email: email }
+                    ]
+                });
+            } else if (email) {
+                user = await usersCollection.findOne({ email: email });
+            }
+
+            if (user) {
+                await usersCollection.updateOne(
+                    { _id: user._id },
+                    { $set: { plan: planId, isPremium: planId === 'user_premium' } }
+                );
+
+                const existingSub = await subscriptionCollection.findOne({ sessionId: session.id });
+                if (!existingSub) {
+                    await subscriptionCollection.insertOne({
+                        userId: user.id || user._id.toString(),
+                        email: user.email,
+                        planId: planId,
+                        sessionId: session.id,
+                        amount: session.amount_total ? session.amount_total / 100 : 1500,
+                        status: 'active',
+                        createdAt: new Date()
+                    });
+                }
+                console.log(`Successfully upgraded user ${user.email} to ${planId} via Webhook`);
+            }
+        }
+    }
+
+    res.json({ received: true });
+});
+
 app.use(express.json());
 
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
@@ -65,21 +124,36 @@ const verifyToken = async (req, res, next) => {
 
     const query = { token: token };
     const session = await sessionCollection.findOne(query);
-
     if (!session) {
         return res.status(401).send({ message: 'unauthorized access' })
     }
 
     const userId = session.userId;
-    const userQuery = {
-        _id: userId
-    };
+    let userQuery;
+
+    if (userId instanceof ObjectId) {
+        userQuery = {
+            $or: [
+                { _id: userId },
+                { _id: userId.toString() }
+            ]
+        };
+    } else if (typeof userId === 'string') {
+        let queries = [{ _id: userId }];
+        if (ObjectId.isValid(userId)) {
+            queries.push({ _id: new ObjectId(userId) });
+        }
+        userQuery = { $or: queries };
+    } else {
+        userQuery = { _id: userId };
+    }
 
     const user = await usersCollection.findOne(userQuery);
     if (!user) {
         return res.status(401).send({ message: 'unauthorized access' })
     }
-    // set data in the req object
+
+
     req.user = user;
     next();
 };
@@ -107,6 +181,152 @@ app.get('/api/lessons/featured', async (req, res) => {
     res.send(featuredLessons);
 });
 
+// Top Contributors endpoint for Homepage
+app.get('/api/lessons/top-contributors', async (req, res) => {
+    try {
+        const getContributors = async (sinceDate) => {
+            const matchStage = sinceDate ? [
+                {
+                    $project: {
+                        author: "$author",
+                        authorEmail: "$authorEmail",
+                        authorName: "$authorName",
+                        authorAvatar: "$authorAvatar",
+                        createdAtDate: {
+                            $cond: {
+                                if: { $eq: [{ $type: "$createdAt" }, "string"] },
+                                then: { $dateFromString: { dateString: "$createdAt" } },
+                                else: { $ifNull: ["$createdAt", new Date()] }
+                            }
+                        }
+                    }
+                },
+                {
+                    $match: {
+                        createdAtDate: { $gte: sinceDate }
+                    }
+                }
+            ] : [
+                {
+                    $project: {
+                        author: "$author",
+                        authorEmail: "$authorEmail",
+                        authorName: "$authorName",
+                        authorAvatar: "$authorAvatar"
+                    }
+                }
+            ];
+
+            return await lessonsCollection.aggregate([
+                ...matchStage,
+                {
+                    $group: {
+                        _id: { $ifNull: ["$authorEmail", "$author.name"] },
+                        name: { $first: { $ifNull: ["$authorName", "$author.name"] } },
+                        avatar: { $first: { $ifNull: ["$authorAvatar", "$author.avatar"] } },
+                        lessonsShared: { $sum: 1 },
+                        email: { $first: "$authorEmail" }
+                    }
+                },
+                {
+                    $lookup: {
+                        from: "user",
+                        localField: "email",
+                        foreignField: "email",
+                        as: "userInfo"
+                    }
+                },
+                {
+                    $addFields: {
+                        userObj: { $arrayElemAt: ["$userInfo", 0] }
+                    }
+                },
+                {
+                    $addFields: {
+                        verified: {
+                            $or: [
+                                { $eq: ["$userObj.role", "admin"] },
+                                { $eq: ["$userObj.plan", "user_premium"] },
+                                { $in: ["$name", ["Marcus Chen", "Akiro Tanaka", "David Vance"]] }
+                            ]
+                        }
+                    }
+                },
+                { $sort: { lessonsShared: -1 } },
+                { $limit: 4 }
+            ]).toArray();
+        };
+
+        // 1. Try last 7 days
+        const sevenDaysAgo = new Date();
+        sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+        let contributors = await getContributors(sevenDaysAgo);
+
+        // 2. Try last 30 days if less than 4
+        if (contributors.length < 4) {
+            const thirtyDaysAgo = new Date();
+            thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+            contributors = await getContributors(thirtyDaysAgo);
+        }
+
+        // 3. Fallback to all-time if less than 4
+        if (contributors.length < 4) {
+            contributors = await getContributors(null);
+        }
+
+        res.send(contributors);
+    } catch (error) {
+        console.error("Error fetching top contributors:", error);
+        res.status(500).send({ error: "Internal Server Error" });
+    }
+});
+
+// Most Saved Lessons endpoint for Homepage
+app.get('/api/lessons/most-saved', async (req, res) => {
+    try {
+        const mostSaved = await lessonsCollection.aggregate([
+            {
+                $match: {
+                    visibility: "public"
+                }
+            },
+            {
+                $lookup: {
+                    from: "favorites",
+                    let: { lessonIdStr: { $toString: "$_id" } },
+                    pipeline: [
+                        {
+                            $match: {
+                                $expr: {
+                                    $eq: ["$lessonId", "$$lessonIdStr"]
+                                }
+                            }
+                        }
+                    ],
+                    as: "favoritesData"
+                }
+            },
+            {
+                $addFields: {
+                    savesCount: {
+                        $add: [
+                            { $ifNull: ["$saves", 0] },
+                            { $size: "$favoritesData" }
+                        ]
+                    }
+                }
+            },
+            { $sort: { savesCount: -1, createdAt: -1 } },
+            { $limit: 3 }
+        ]).toArray();
+
+        res.send(mostSaved);
+    } catch (error) {
+        console.error("Error fetching most saved lessons:", error);
+        res.status(500).send({ error: "Internal Server Error" });
+    }
+});
+
 // Lessons endpoint with search, category filtering, and pagination support
 app.get('/api/lessons', async (req, res) => {
     console.log('server side query:', req.query);
@@ -127,6 +347,48 @@ app.get('/api/lessons', async (req, res) => {
         query.emotionalTone = { $regex: new RegExp(`^${req.query.emotionalTone}$`, 'i') };
     }
 
+    // Determine sorting parameters
+    let sortStage = { createdAt: -1 }; // default newest
+    if (req.query.sortBy === 'oldest') {
+        sortStage = { createdAt: 1 };
+    } else if (req.query.sortBy === 'title-asc') {
+        sortStage = { title: 1 };
+    } else if (req.query.sortBy === 'title-desc') {
+        sortStage = { title: -1 };
+    } else if (req.query.sortBy === 'most-saved') {
+        sortStage = { savesCount: -1, createdAt: -1 };
+    } else if (req.query.sortBy === 'newest') {
+        sortStage = { createdAt: -1 };
+    }
+
+    // Build aggregation pipeline to support "most-saved" sorting dynamically
+    const pipeline = [
+        { $match: query },
+        {
+            $lookup: {
+                from: "favorites",
+                let: { lessonIdStr: { $toString: "$_id" } },
+                pipeline: [
+                    {
+                        $match: {
+                            $expr: {
+                                $eq: ["$lessonId", "$$lessonIdStr"]
+                            }
+                        }
+                    }
+                ],
+                as: "favoritesData"
+            }
+        },
+        {
+            $addFields: {
+                savesCount: { $size: "$favoritesData" }
+            }
+        },
+        { $project: { favoritesData: 0 } },
+        { $sort: sortStage }
+    ];
+
     // pagination related work
     if (req.query.page) {
         const page = parseInt(req.query.page);
@@ -134,13 +396,14 @@ app.get('/api/lessons', async (req, res) => {
         const skipItems = (page - 1) * perPage;
 
         const total = await lessonsCollection.countDocuments(query);
-        const cursor = lessonsCollection.find(query).skip(skipItems).limit(perPage);
-        const lessons = await cursor.toArray();
+        pipeline.push({ $skip: skipItems });
+        pipeline.push({ $limit: perPage });
+
+        const lessons = await lessonsCollection.aggregate(pipeline).toArray();
         return res.send({ total, lessons });
     }
 
-    const cursor = lessonsCollection.find(query);
-    const result = await cursor.toArray();
+    const result = await lessonsCollection.aggregate(pipeline).toArray();
     res.send(result);
 });
 
@@ -262,13 +525,14 @@ app.post('/api/lessons/:id/like', verifyToken, async (req, res) => {
         return res.status(404).send({ error: 'Lesson not found' });
     }
 
-    const likes = lesson.likes || [];
+    let likes = Array.isArray(lesson.likes) ? lesson.likes : [];
     let updateDoc;
 
     if (likes.includes(userId)) {
-        updateDoc = { $pull: { likes: userId } };
+        updateDoc = { $set: { likes: likes.filter(uid => uid !== userId) } };
     } else {
-        updateDoc = { $addToSet: { likes: userId } };
+        likes.push(userId);
+        updateDoc = { $set: { likes: likes } };
     }
 
     const result = await lessonsCollection.updateOne(filter, updateDoc);
@@ -362,7 +626,6 @@ app.post('/api/favorites', verifyToken, async (req, res) => {
 
 // admin users list
 app.get('/api/admin/users', verifyToken, verifyAdmin, async (req, res) => {
-    try {
         const users = await usersCollection.find({}).toArray();
         const usersWithCount = await Promise.all(users.map(async (usr) => {
             const count = await lessonsCollection.countDocuments({ authorEmail: usr.email });
@@ -372,10 +635,6 @@ app.get('/api/admin/users', verifyToken, verifyAdmin, async (req, res) => {
             };
         }));
         res.send(usersWithCount);
-    } catch (err) {
-        console.error("Error fetching admin users:", err);
-        res.status(500).send({ error: "Failed to fetch users" });
-    }
 });
 
 // admin update user
@@ -405,7 +664,7 @@ app.patch('/api/admin/users/:id', verifyToken, verifyAdmin, async (req, res) => 
 
 // admin delete user
 app.delete('/api/admin/users/:id', verifyToken, verifyAdmin, async (req, res) => {
-    try {
+
         const id = req.params.id;
         
         let query = { _id: id };
@@ -432,15 +691,10 @@ app.delete('/api/admin/users/:id', verifyToken, verifyAdmin, async (req, res) =>
         }
 
         res.send(result);
-    } catch (err) {
-        console.error("Error deleting user:", err);
-        res.status(500).send({ error: "Failed to delete user" });
-    }
 });
 
 // admin dashboard stats
 app.get('/api/admin/stats', verifyToken, verifyAdmin, async (req, res) => {
-    try {
         const totalUsers = await usersCollection.countDocuments({});
         const totalLessons = await lessonsCollection.countDocuments({});
         const premiumUsers = await usersCollection.countDocuments({ plan: 'user_premium' });
@@ -452,14 +706,20 @@ app.get('/api/admin/stats', verifyToken, verifyAdmin, async (req, res) => {
         
         const today = new Date();
         today.setHours(0, 0, 0, 0);
-        const todayLessons = await lessonsCollection.countDocuments({ createdAt: { $gte: today } });
+        const todayIsoString = today.toISOString();
+        const todayLessons = await lessonsCollection.countDocuments({
+            $or: [
+                { createdAt: { $gte: today } },
+                { createdAt: { $gte: todayIsoString } }
+            ]
+        });
 
         const activeContributors = await lessonsCollection.aggregate([
             {
                 $group: {
-                    _id: "$authorEmail",
-                    name: { $first: "$authorName" },
-                    avatar: { $first: "$authorAvatar" },
+                    _id: { $ifNull: ["$authorEmail", "$author.name"] },
+                    name: { $first: { $ifNull: ["$authorName", "$author.name"] } },
+                    avatar: { $first: { $ifNull: ["$authorAvatar", "$author.avatar"] } },
                     count: { $sum: 1 }
                 }
             },
@@ -474,12 +734,18 @@ app.get('/api/admin/stats', verifyToken, verifyAdmin, async (req, res) => {
         const userGrowth = await usersCollection.aggregate([
             {
                 $project: {
-                    createdAt: { $ifNull: ["$createdAt", new Date()] }
+                    createdAtDate: {
+                        $cond: {
+                            if: { $eq: [{ $type: "$createdAt" }, "string"] },
+                            then: { $dateFromString: { dateString: "$createdAt" } },
+                            else: { $ifNull: ["$createdAt", new Date()] }
+                        }
+                    }
                 }
             },
             {
                 $group: {
-                    _id: { $dateToString: { format: "%Y-%m", date: "$createdAt" } },
+                    _id: { $dateToString: { format: "%Y-%m", date: "$createdAtDate" } },
                     count: { $sum: 1 }
                 }
             },
@@ -489,12 +755,18 @@ app.get('/api/admin/stats', verifyToken, verifyAdmin, async (req, res) => {
         const lessonGrowth = await lessonsCollection.aggregate([
             {
                 $project: {
-                    createdAt: { $ifNull: ["$createdAt", new Date()] }
+                    createdAtDate: {
+                        $cond: {
+                            if: { $eq: [{ $type: "$createdAt" }, "string"] },
+                            then: { $dateFromString: { dateString: "$createdAt" } },
+                            else: { $ifNull: ["$createdAt", new Date()] }
+                        }
+                    }
                 }
             },
             {
                 $group: {
-                    _id: { $dateToString: { format: "%Y-%m", date: "$createdAt" } },
+                    _id: { $dateToString: { format: "%Y-%m", date: "$createdAtDate" } },
                     count: { $sum: 1 }
                 }
             },
@@ -515,10 +787,6 @@ app.get('/api/admin/stats', verifyToken, verifyAdmin, async (req, res) => {
             userGrowth,
             lessonGrowth
         });
-    } catch (err) {
-        console.error("Error computing admin stats:", err);
-        res.status(500).send({ error: "Failed to compute stats" });
-    }
 });
 
 // plans 
@@ -546,6 +814,7 @@ app.post('/api/subscriptions', async (req, res) => {
     const updateDocument = {
         $set: {
             plan: data.planId,
+            isPremium: data.planId === 'user_premium',
         },
     };
 
