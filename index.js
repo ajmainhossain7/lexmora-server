@@ -3,13 +3,14 @@ dns.setServers(['8.8.8.8', '8.8.4.4']);
 
 const express = require('express');
 const cors = require('cors');
+const multer = require('multer');
+const FormData = require('form-data');
+const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
 const app = express();
 const port = process.env.PORT || 5000;
 require('dotenv').config();
 
-
 app.use(cors());
-
 
 // Stripe Webhook endpoint (defined before global json body parser)
 app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
@@ -153,7 +154,6 @@ const verifyToken = async (req, res, next) => {
         return res.status(401).send({ message: 'unauthorized access' })
     }
 
-
     req.user = user;
     next();
 };
@@ -175,7 +175,7 @@ const verifyAdmin = async (req, res, next) => {
 // Featured Lessons endpoint for Homepage
 app.get('/api/lessons/featured', async (req, res) => {
     const featuredLessons = await lessonsCollection
-        .find({ isFeatured: true })
+        .find({ isFeatured: true, visibility: 'public' })
         .sort({ createdAt: -1 })
         .toArray();
     res.send(featuredLessons);
@@ -184,95 +184,44 @@ app.get('/api/lessons/featured', async (req, res) => {
 // Top Contributors endpoint for Homepage
 app.get('/api/lessons/top-contributors', async (req, res) => {
     try {
-        const getContributors = async (sinceDate) => {
-            const matchStage = sinceDate ? [
-                {
-                    $project: {
-                        author: "$author",
-                        authorEmail: "$authorEmail",
-                        authorName: "$authorName",
-                        authorAvatar: "$authorAvatar",
-                        createdAtDate: {
-                            $cond: {
-                                if: { $eq: [{ $type: "$createdAt" }, "string"] },
-                                then: { $dateFromString: { dateString: "$createdAt" } },
-                                else: { $ifNull: ["$createdAt", new Date()] }
-                            }
-                        }
-                    }
-                },
-                {
-                    $match: {
-                        createdAtDate: { $gte: sinceDate }
+        const contributors = await lessonsCollection.aggregate([
+            { $match: { visibility: "public" } },
+            {
+                $group: {
+                    _id: { $ifNull: ["$authorEmail", "$author.name"] },
+                    name: { $first: { $ifNull: ["$authorName", "$author.name"] } },
+                    avatar: { $first: { $ifNull: ["$authorAvatar", "$author.avatar"] } },
+                    lessonsShared: { $sum: 1 },
+                    email: { $first: "$authorEmail" }
+                }
+            },
+            {
+                $lookup: {
+                    from: "user",
+                    localField: "email",
+                    foreignField: "email",
+                    as: "userInfo"
+                }
+            },
+            {
+                $addFields: {
+                    userObj: { $arrayElemAt: ["$userInfo", 0] }
+                }
+            },
+            {
+                $addFields: {
+                    verified: {
+                        $or: [
+                            { $eq: ["$userObj.role", "admin"] },
+                            { $eq: ["$userObj.plan", "user_premium"] },
+                            { $in: ["$name", ["Marcus Chen", "Akiro Tanaka", "David Vance"]] }
+                        ]
                     }
                 }
-            ] : [
-                {
-                    $project: {
-                        author: "$author",
-                        authorEmail: "$authorEmail",
-                        authorName: "$authorName",
-                        authorAvatar: "$authorAvatar"
-                    }
-                }
-            ];
-
-            return await lessonsCollection.aggregate([
-                ...matchStage,
-                {
-                    $group: {
-                        _id: { $ifNull: ["$authorEmail", "$author.name"] },
-                        name: { $first: { $ifNull: ["$authorName", "$author.name"] } },
-                        avatar: { $first: { $ifNull: ["$authorAvatar", "$author.avatar"] } },
-                        lessonsShared: { $sum: 1 },
-                        email: { $first: "$authorEmail" }
-                    }
-                },
-                {
-                    $lookup: {
-                        from: "user",
-                        localField: "email",
-                        foreignField: "email",
-                        as: "userInfo"
-                    }
-                },
-                {
-                    $addFields: {
-                        userObj: { $arrayElemAt: ["$userInfo", 0] }
-                    }
-                },
-                {
-                    $addFields: {
-                        verified: {
-                            $or: [
-                                { $eq: ["$userObj.role", "admin"] },
-                                { $eq: ["$userObj.plan", "user_premium"] },
-                                { $in: ["$name", ["Marcus Chen", "Akiro Tanaka", "David Vance"]] }
-                            ]
-                        }
-                    }
-                },
-                { $sort: { lessonsShared: -1 } },
-                { $limit: 4 }
-            ]).toArray();
-        };
-
-        // 1. Try last 7 days
-        const sevenDaysAgo = new Date();
-        sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-        let contributors = await getContributors(sevenDaysAgo);
-
-        // 2. Try last 30 days if less than 4
-        if (contributors.length < 4) {
-            const thirtyDaysAgo = new Date();
-            thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-            contributors = await getContributors(thirtyDaysAgo);
-        }
-
-        // 3. Fallback to all-time if less than 4
-        if (contributors.length < 4) {
-            contributors = await getContributors(null);
-        }
+            },
+            { $sort: { lessonsShared: -1 } },
+            { $limit: 4 }
+        ]).toArray();
 
         res.send(contributors);
     } catch (error) {
@@ -331,6 +280,12 @@ app.get('/api/lessons/most-saved', async (req, res) => {
 app.get('/api/lessons', async (req, res) => {
     console.log('server side query:', req.query);
     const query = {};
+
+    if (req.query.visibility && req.query.visibility !== 'all') {
+        query.visibility = req.query.visibility;
+    } else if (!req.query.visibility) {
+        query.visibility = 'public';
+    }
 
     if (req.query.search) {
         query.$or = [
@@ -626,15 +581,15 @@ app.post('/api/favorites', verifyToken, async (req, res) => {
 
 // admin users list
 app.get('/api/admin/users', verifyToken, verifyAdmin, async (req, res) => {
-        const users = await usersCollection.find({}).toArray();
-        const usersWithCount = await Promise.all(users.map(async (usr) => {
-            const count = await lessonsCollection.countDocuments({ authorEmail: usr.email });
-            return {
-                ...usr,
-                lessonsCount: count
-            };
-        }));
-        res.send(usersWithCount);
+    const users = await usersCollection.find({}).toArray();
+    const usersWithCount = await Promise.all(users.map(async (usr) => {
+        const count = await lessonsCollection.countDocuments({ authorEmail: usr.email });
+        return {
+            ...usr,
+            lessonsCount: count
+        };
+    }));
+    res.send(usersWithCount);
 });
 
 // admin update user
@@ -665,128 +620,129 @@ app.patch('/api/admin/users/:id', verifyToken, verifyAdmin, async (req, res) => 
 // admin delete user
 app.delete('/api/admin/users/:id', verifyToken, verifyAdmin, async (req, res) => {
 
-        const id = req.params.id;
-        
-        let query = { _id: id };
-        let user = await usersCollection.findOne(query);
-        if (!user) {
-            query = { _id: new ObjectId(id) };
-            user = await usersCollection.findOne(query);
-        }
+    const id = req.params.id;
 
-        if (!user) {
-            return res.status(404).send({ error: 'User not found' });
-        }
+    let query = { _id: id };
+    let user = await usersCollection.findOne(query);
+    if (!user) {
+        query = { _id: new ObjectId(id) };
+        user = await usersCollection.findOne(query);
+    }
 
-        // Prevent self deletion
-        if (user.email === req.user.email) {
-            return res.status(400).send({ error: 'You cannot delete your own admin account!' });
-        }
+    if (!user) {
+        return res.status(404).send({ error: 'User not found' });
+    }
 
-        const result = await usersCollection.deleteOne(query);
-        
-        // Cascade delete: delete all lessons created by this user
-        if (user.email) {
-            await lessonsCollection.deleteMany({ authorEmail: user.email });
-        }
+    // Prevent self deletion
+    if (user.email === req.user.email) {
+        return res.status(400).send({ error: 'You cannot delete your own admin account!' });
+    }
 
-        res.send(result);
+    const result = await usersCollection.deleteOne(query);
+
+    // Cascade delete: delete all lessons created by this user
+    if (user.email) {
+        await lessonsCollection.deleteMany({ authorEmail: user.email });
+    }
+
+    res.send(result);
 });
 
 // admin dashboard stats
 app.get('/api/admin/stats', verifyToken, verifyAdmin, async (req, res) => {
-        const totalUsers = await usersCollection.countDocuments({});
-        const totalLessons = await lessonsCollection.countDocuments({});
-        const premiumUsers = await usersCollection.countDocuments({ plan: 'user_premium' });
-        const totalRevenue = premiumUsers * 1500;
-        const totalReports = await reportsCollection.countDocuments({});
-        
-        const publicLessons = await lessonsCollection.countDocuments({ visibility: 'public' });
-        const privateLessons = await lessonsCollection.countDocuments({ visibility: 'private' });
-        
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
-        const todayIsoString = today.toISOString();
-        const todayLessons = await lessonsCollection.countDocuments({
-            $or: [
-                { createdAt: { $gte: today } },
-                { createdAt: { $gte: todayIsoString } }
-            ]
-        });
+    const totalUsers = await usersCollection.countDocuments({});
+    const totalLessons = await lessonsCollection.countDocuments({});
+    const premiumUsers = await usersCollection.countDocuments({ plan: 'user_premium' });
+    const totalRevenue = premiumUsers * 1500;
+    const totalReports = await reportsCollection.countDocuments({});
 
-        const activeContributors = await lessonsCollection.aggregate([
-            {
-                $group: {
-                    _id: { $ifNull: ["$authorEmail", "$author.name"] },
-                    name: { $first: { $ifNull: ["$authorName", "$author.name"] } },
-                    avatar: { $first: { $ifNull: ["$authorAvatar", "$author.avatar"] } },
-                    count: { $sum: 1 }
-                }
-            },
-            { $sort: { count: -1 } },
-            { $limit: 5 }
-        ]).toArray();
+    const publicLessons = await lessonsCollection.countDocuments({ visibility: 'public' });
+    const privateLessons = await lessonsCollection.countDocuments({ visibility: 'private' });
 
-        const lessonsByCategory = await lessonsCollection.aggregate([
-            { $group: { _id: "$category", count: { $sum: 1 } } }
-        ]).toArray();
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const todayIsoString = today.toISOString();
+    const todayLessons = await lessonsCollection.countDocuments({
+        $or: [
+            { createdAt: { $gte: today } },
+            { createdAt: { $gte: todayIsoString } }
+        ]
+    });
 
-        const userGrowth = await usersCollection.aggregate([
-            {
-                $project: {
-                    createdAtDate: {
-                        $cond: {
-                            if: { $eq: [{ $type: "$createdAt" }, "string"] },
-                            then: { $dateFromString: { dateString: "$createdAt" } },
-                            else: { $ifNull: ["$createdAt", new Date()] }
-                        }
+    const activeContributors = await lessonsCollection.aggregate([
+        { $match: { visibility: "public" } },
+        {
+            $group: {
+                _id: { $ifNull: ["$authorEmail", "$author.name"] },
+                name: { $first: { $ifNull: ["$authorName", "$author.name"] } },
+                avatar: { $first: { $ifNull: ["$authorAvatar", "$author.avatar"] } },
+                count: { $sum: 1 }
+            }
+        },
+        { $sort: { count: -1 } },
+        { $limit: 5 }
+    ]).toArray();
+
+    const lessonsByCategory = await lessonsCollection.aggregate([
+        { $group: { _id: "$category", count: { $sum: 1 } } }
+    ]).toArray();
+
+    const userGrowth = await usersCollection.aggregate([
+        {
+            $project: {
+                createdAtDate: {
+                    $cond: {
+                        if: { $eq: [{ $type: "$createdAt" }, "string"] },
+                        then: { $dateFromString: { dateString: "$createdAt" } },
+                        else: { $ifNull: ["$createdAt", new Date()] }
                     }
                 }
-            },
-            {
-                $group: {
-                    _id: { $dateToString: { format: "%Y-%m", date: "$createdAtDate" } },
-                    count: { $sum: 1 }
-                }
-            },
-            { $sort: { _id: 1 } }
-        ]).toArray();
+            }
+        },
+        {
+            $group: {
+                _id: { $dateToString: { format: "%Y-%m", date: "$createdAtDate" } },
+                count: { $sum: 1 }
+            }
+        },
+        { $sort: { _id: 1 } }
+    ]).toArray();
 
-        const lessonGrowth = await lessonsCollection.aggregate([
-            {
-                $project: {
-                    createdAtDate: {
-                        $cond: {
-                            if: { $eq: [{ $type: "$createdAt" }, "string"] },
-                            then: { $dateFromString: { dateString: "$createdAt" } },
-                            else: { $ifNull: ["$createdAt", new Date()] }
-                        }
+    const lessonGrowth = await lessonsCollection.aggregate([
+        {
+            $project: {
+                createdAtDate: {
+                    $cond: {
+                        if: { $eq: [{ $type: "$createdAt" }, "string"] },
+                        then: { $dateFromString: { dateString: "$createdAt" } },
+                        else: { $ifNull: ["$createdAt", new Date()] }
                     }
                 }
-            },
-            {
-                $group: {
-                    _id: { $dateToString: { format: "%Y-%m", date: "$createdAtDate" } },
-                    count: { $sum: 1 }
-                }
-            },
-            { $sort: { _id: 1 } }
-        ]).toArray();
+            }
+        },
+        {
+            $group: {
+                _id: { $dateToString: { format: "%Y-%m", date: "$createdAtDate" } },
+                count: { $sum: 1 }
+            }
+        },
+        { $sort: { _id: 1 } }
+    ]).toArray();
 
-        res.send({
-            totalUsers,
-            totalLessons,
-            premiumUsers,
-            totalRevenue,
-            totalReports,
-            publicLessons,
-            privateLessons,
-            todayLessons,
-            activeContributors,
-            lessonsByCategory,
-            userGrowth,
-            lessonGrowth
-        });
+    res.send({
+        totalUsers,
+        totalLessons,
+        premiumUsers,
+        totalRevenue,
+        totalReports,
+        publicLessons,
+        privateLessons,
+        todayLessons,
+        activeContributors,
+        lessonsByCategory,
+        userGrowth,
+        lessonGrowth
+    });
 });
 
 // plans 
